@@ -1,6 +1,7 @@
 /**
  * Created by frank on 17-5-22.
  */
+import com.sun.javaws.exceptions.InvalidArgumentException;
 import javafx.util.Pair;
 import org.apache.lucene.analysis.*;
 import org.apache.lucene.document.*;
@@ -8,15 +9,12 @@ import org.apache.lucene.index.*;
 import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.search.*;
 import org.apache.lucene.search.highlight.*;
-import org.apache.lucene.search.vectorhighlight.FieldQuery;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.SimpleFSDirectory;
 import org.apache.lucene.util.Version;
 import org.wltea.analyzer.lucene.IKAnalyzer;
 
 import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.util.*;
 
 public class SearchEngine
@@ -25,9 +23,12 @@ public class SearchEngine
     private final String FieldSong = "song";
     private final String FieldSinger = "singer";
     private final String FieldLrc = "lrc";
+    private final String FieldAll = "all";
     private final String FieldPublishTime = "publishTime";
     private final String FieldPopularity = "popularity";
-    private final String ActionClick = "click";
+    private final String ActionUpdate = "update";
+
+    private final Double lrcThreshold = 3.0;
 
     class MyDoc
     {
@@ -170,19 +171,19 @@ public class SearchEngine
         public double popularity;
     }
 
-    private static SearchEngine single;
+    private static SearchEngine singleton;
 
     public static SearchEngine instance()
     {
         try {
-            if (single == null) {
-                single = new SearchEngine();
+            if (singleton == null) {
+                singleton = new SearchEngine();
             }
         }catch (Exception e) {
             e.printStackTrace();
         }
 
-        return single;
+        return singleton;
     }
 
     private SearchEngine() throws Exception
@@ -191,15 +192,116 @@ public class SearchEngine
         directory = new SimpleFSDirectory(new File("./index"));
         directoryReader = DirectoryReader.open(directory);
         indexSearcher = new IndexSearcher(directoryReader);
-        boostFactor = new HashMap<>();
+        clickTimes = new HashMap<>();
+        singers = new HashSet<>();
+
+        BufferedReader reader =
+                new BufferedReader(
+                        new InputStreamReader(
+                                new FileInputStream("src/singer.dic")));
+
+        try {
+            while (true) {
+                String s = reader.readLine();
+                if (!s.isEmpty()) {
+                    singers.add(s);
+                }
+            }
+        }
+        catch (Exception e) {
+            System.out.println(singers.size() + " singers");
+        }
 
         System.out.println(directoryReader.numDocs() + " docs in search engine");
     }
 
-    public void choose(int songId)
+    public void update(int songId, int times)
     {
-        double b = boostFactor.getOrDefault(songId, 1.0);
-        boostFactor.put(songId, b + 0.2);
+        System.out.printf("update %d %d times\n", songId, times);
+        clickTimes.put(songId, times);
+    }
+
+    public String search(String input)
+    {
+        Vector<Pair<String, String>> query = parseQuery(input);
+        MyDoc[] docs = null;
+
+        try {
+            for (Pair<String, String> p : query) {
+                String key = p.getKey();
+                String value = p.getValue();
+                MyDoc[] newDocs = null;
+                switch (key) {
+
+                    case ActionUpdate:
+                        String[] s = value.split("[ |\t]");
+                        if (s.length != 2) {
+                            throw new InvalidArgumentException(null);
+                        }
+                        update(Integer.valueOf(s[0]), Integer.valueOf(s[1]));
+                        break;
+
+                    case FieldId:
+                    case FieldSong:
+                    case FieldSinger:
+                    case FieldLrc:
+                        newDocs = searchField(key, value);
+                        break;
+
+                    case FieldAll:
+                        if (singers.contains(value)) {
+                            // 优先从词典中匹配歌手名
+                            newDocs = searchField(FieldSinger, value);
+                            System.out.printf("hits %d\n", newDocs.length);
+                        }
+                        else {
+                            // 歌名
+                            newDocs = searchField(FieldSong, value);
+                            sortDocs(newDocs);
+                            System.out.printf("hits %d\n", newDocs.length);
+                            if (newDocs.length > 0) {
+                                System.out.printf("song score %f \n", newDocs[0].score);
+                            }
+                            if (newDocs.length == 0 || newDocs[0].score < lrcThreshold) {
+                                // 歌词优先级最低
+                                newDocs = searchField(FieldLrc, value);
+                                sortDocs(newDocs);
+                                System.out.printf("hits %d\n", newDocs.length);
+                                if (newDocs.length > 0) {
+                                    System.out.printf("lrc score %f \n", newDocs[0].score);
+                                }
+                            }
+                        }
+                        break;
+
+                    default:
+                        throw new InvalidArgumentException(null);
+                }
+
+                if (docs == null) {
+                    docs = newDocs;
+                } else {
+                    docs = intersectDocs(docs, newDocs);
+                }
+            }
+        }
+        catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        if (docs == null) {
+            docs = new MyDoc[0];
+        }
+
+        sortDocs(docs);
+        StringBuilder buf = new StringBuilder(128);
+        buf.append(String.format("hits: %d\r\n\r\n", docs.length));
+        for (MyDoc d : docs) {
+            buf.append(d.toString());
+            buf.append("\r\n");
+        }
+
+        return buf.toString();
     }
 
     private Vector<Pair<String, String>> parseQuery(String input)
@@ -232,9 +334,13 @@ public class SearchEngine
                 else if (pair[0].equalsIgnoreCase(FieldLrc)) {
                     pair[0] = FieldLrc;
                 }
-                else if (pair[0].equalsIgnoreCase(ActionClick)) {
-                    pair[0] = ActionClick;
+                else if (pair[0].equalsIgnoreCase(FieldAll)) {
+                    pair[0] = FieldAll;
                 }
+                else if (pair[0].equalsIgnoreCase(ActionUpdate)) {
+                    pair[0] = ActionUpdate;
+                }
+
                 else {
                     throw new IOException("invalid query");
                 }
@@ -248,52 +354,6 @@ public class SearchEngine
         return ret;
     }
 
-    public String search(String input)
-    {
-        Vector<Pair<String, String>> query = parseQuery(input);
-        MyDoc[] docs = null;
-
-        try {
-            for (Pair<String, String> p : query) {
-                switch (p.getKey()) {
-                    case ActionClick:
-                        choose(Integer.valueOf(p.getValue()));
-                        break;
-                    case FieldId:
-                    case FieldSong:
-                    case FieldSinger:
-                    case FieldLrc:
-                        MyDoc[] newDocs = searchField(p.getKey(), p.getValue());
-                        if (docs == null) {
-                            docs = newDocs;
-                        } else {
-                            docs = intersectDocs(docs, newDocs);
-                        }
-                        break;
-                    default:
-                        break;
-                }
-            }
-        }
-        catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        if (docs == null) {
-            docs = new MyDoc[0];
-        }
-
-        sortDocs(docs);
-        StringBuilder buf = new StringBuilder(128);
-        buf.append(String.format("hits: %d\r\n\r\n", docs.length));
-        for (MyDoc d : docs) {
-            buf.append(d.toString());
-            buf.append("\r\n");
-        }
-
-        return buf.toString();
-    }
-
     private MyDoc[] searchField(String name, String value) throws Exception
     {
         QueryParser parser = new QueryParser(Version.LUCENE_40, name, analyzer);
@@ -301,10 +361,14 @@ public class SearchEngine
         ScoreDoc[] sdocs = indexSearcher.search(query, 100).scoreDocs;
         MyDoc[] mdocs = new MyDoc[sdocs.length];
 
-        /* 自定义的boost因子，只有运行时存在 */
+
         for (int i = 0; i < mdocs.length; ++i) {
             mdocs[i] = new MyDoc(sdocs[i], query, name, value);
-            mdocs[i].score = sdocs[i].score * boostFactor.getOrDefault(mdocs[i].id, 1.0);
+
+            int id = mdocs[i].id;
+            int times = clickTimes.getOrDefault(id, 0);
+
+            mdocs[i].score = sdocs[i].score * (1 + Math.log(1 + times));
         }
 
         System.out.println(query);
@@ -353,24 +417,24 @@ public class SearchEngine
         Arrays.sort(docs, new MyComparator());
     }
 
-//    private int nToken(String input) throws Exception
-//    {
-//        int tokens = 0;
-//        TokenStream ts = analyzer.tokenStream("myfield", new StringReader(input));
-//
-//        //重置TokenStream（重置StringReader）
-//        ts.reset();
-//
-//        //迭代获取分词结果
-//        while (ts.incrementToken()) {
-//            ++tokens;
-//        }
-//
-//        //关闭TokenStream（关闭StringReader）
-//        ts.end();
-//
-//        return tokens;
-//    }
+    private int nToken(String input) throws Exception
+    {
+        int tokens = 0;
+        TokenStream ts = analyzer.tokenStream("myfield", new StringReader(input));
+
+        //重置TokenStream（重置StringReader）
+        ts.reset();
+
+        //迭代获取分词结果
+        while (ts.incrementToken()) {
+            ++tokens;
+        }
+
+        //关闭TokenStream（关闭StringReader）
+        ts.end();
+
+        return tokens;
+    }
 
     private MyDoc[] intersectDocs(MyDoc[] a, MyDoc[] b)
     {
@@ -387,11 +451,32 @@ public class SearchEngine
         return vec.toArray(arr);
     }
 
+    private MyDoc[] unionDocs(MyDoc[] a, MyDoc[] b)
+    {
+        Vector<MyDoc> vec = new Vector<>();
+        Collections.addAll(vec, b);
+        for (MyDoc d1 : a) {
+            boolean found = false;
+            for (MyDoc d2 : b) {
+                if (d1.id == d2.id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                vec.add(d1);
+            }
+        }
+        MyDoc[] arr = new MyDoc[vec.size()];
+        return vec.toArray(arr);
+    }
+
+    private HashSet<String> singers;
     private Analyzer analyzer;
     private Directory directory;
     private DirectoryReader directoryReader;
     private IndexSearcher indexSearcher;
-    private HashMap<Integer, Double> boostFactor;
+    private HashMap<Integer, Integer> clickTimes;
 
     public static void main(String[] args) throws Exception
     {
@@ -412,7 +497,7 @@ public class SearchEngine
 
             //System.out.print("click: ");
             //int click = Integer.valueOf(reader.readLine());
-            //se.choose(click);
+            //se.update(click);
         }
     }
 }
